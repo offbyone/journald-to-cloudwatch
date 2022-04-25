@@ -6,10 +6,10 @@ use aws_sdk_cloudwatchlogs::model::InputLogEvent;
 use chrono::Utc;
 use configuration::Configuration;
 use std::process::exit;
-use systemd::journal::{Journal, JournalFiles, JournalRecord, JournalSeek};
+use systemd::{journal, Journal};
 use tokio::sync::mpsc::{self, UnboundedSender};
 
-fn get_record_timestamp_millis(record: &JournalRecord) -> i64 {
+fn get_record_timestamp_millis(record: &journal::JournalRecord) -> i64 {
     if let Some(timestamp) = record.get("_SOURCE_REALTIME_TIMESTAMP") {
         if let Ok(timestamp) = timestamp.parse::<i64>() {
             // Convert microseconds to milliseconds
@@ -20,7 +20,7 @@ fn get_record_timestamp_millis(record: &JournalRecord) -> i64 {
     Utc::now().timestamp_millis()
 }
 
-fn get_record_comm(record: &JournalRecord) -> &str {
+fn get_record_comm(record: &journal::JournalRecord) -> &str {
     if let Some(comm) = record.get("_COMM") {
         comm
     } else {
@@ -28,7 +28,7 @@ fn get_record_comm(record: &JournalRecord) -> &str {
     }
 }
 
-fn parse_record(record: &JournalRecord) -> Option<InputLogEvent> {
+fn parse_record(record: &journal::JournalRecord) -> Option<InputLogEvent> {
     if let Some(message) = record.get("MESSAGE") {
         Some(
             InputLogEvent::builder()
@@ -49,12 +49,14 @@ async fn run_main_loop(
     conf: Configuration,
     tx: UnboundedSender<InputLogEvent>,
 ) {
-    let runtime_only = false;
-    let local_only = false;
-    match Journal::open(JournalFiles::All, runtime_only, local_only) {
+    match journal::OpenOptions::default()
+        .local_only(false)
+        .runtime_only(false)
+        .open()
+    {
         Ok(mut journal) => {
             // Move to the end of the message log
-            if let Err(err) = journal.seek(JournalSeek::Tail) {
+            if let Err(err) = journal.seek(journal::JournalSeek::Tail) {
                 eprintln!("failed to seek to tail: {}", err);
             }
 
@@ -93,7 +95,7 @@ fn handle_journal_entry_loop(
 async fn main() {
     let conf = Configuration::new().await;
     let conf2 = conf.clone();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, rx) = mpsc::unbounded_channel();
     let uploader = tokio::spawn(cloudwatch::upload_thread(conf2, rx));
     if let Err(err) = tokio::spawn(run_main_loop(conf, tx)).await {
         eprintln!(
