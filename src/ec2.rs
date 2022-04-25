@@ -1,22 +1,26 @@
-use rusoto_core::{Region, RusotoError};
-use rusoto_ec2::{
-    DescribeInstancesError, DescribeInstancesRequest, Ec2, Ec2Client, Filter,
-};
+use aws_sdk_ec2::error::DescribeInstancesError;
+use aws_sdk_ec2::types::SdkError;
+use aws_sdk_ec2::Client;
+use aws_types::SdkConfig;
+use reqwest::ClientBuilder;
+use std::time::Duration;
 
 /// Use the link-local interface to get the instance ID
 ///
 /// Reference:
 /// docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-instance-metadata.html
-pub fn get_instance_id() -> reqwest::Result<String> {
-    let client = reqwest::Client::new();
+pub async fn get_instance_id() -> reqwest::Result<String> {
+    let client = ClientBuilder::new()
+        .timeout(Duration::from_secs(3))
+        .build()?;
     let url = "http://169.254.169.254/latest/meta-data/instance-id";
-    let id = client.get(url).send()?.error_for_status()?.text()?;
-    Ok(id)
+    let response = client.get(url).send().await;
+    response?.error_for_status()?.text().await
 }
 
 #[derive(Debug)]
 pub enum InstanceNameError {
-    DescribeInstancesError(RusotoError<DescribeInstancesError>),
+    DescribeInstancesError(SdkError<DescribeInstancesError>),
     MissingReservations,
     EmptyReservations,
     MissingInstances,
@@ -26,19 +30,17 @@ pub enum InstanceNameError {
 }
 
 /// Use the instance ID to look up the instance's name tag
-pub fn get_instance_name(
+pub async fn get_instance_name(
+    sdk_config: SdkConfig,
     instance_id: String,
 ) -> Result<String, InstanceNameError> {
-    let client = Ec2Client::new(Region::default());
+    let client = Client::new(&sdk_config);
     let result = client
-        .describe_instances(DescribeInstancesRequest {
-            filters: Some(vec![Filter {
-                name: Some("instance-id".to_string()),
-                values: Some(vec![instance_id]),
-            }]),
-            ..Default::default()
-        })
-        .sync();
+        .describe_instances()
+        .set_instance_ids(Some(vec![instance_id]))
+        .send()
+        .await;
+
     match result {
         Ok(result) => {
             if let Some(reservations) = result.reservations {

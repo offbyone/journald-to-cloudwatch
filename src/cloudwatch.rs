@@ -1,45 +1,49 @@
 use crate::configuration::Configuration;
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_cloudwatchlogs::model::{InputLogEvent, LogStream};
+use aws_sdk_cloudwatchlogs::{Client, Region};
 use chrono::Utc;
-use rusoto_core::Region;
-use rusoto_logs::{
-    CloudWatchLogs, CloudWatchLogsClient, CreateLogStreamRequest,
-    DescribeLogStreamsRequest, InputLogEvent, LogStream, PutLogEventsRequest,
-};
-use std::sync::mpsc;
-use std::time::Duration;
+
+use tokio::sync::mpsc;
 
 trait Uploader {
     fn upload(&mut self, events: Vec<InputLogEvent>);
 }
 
 struct CloudWatch {
-    client: CloudWatchLogsClient,
+    client: Client,
     sequence_token: Option<String>,
     conf: Configuration,
 }
 
 impl CloudWatch {
-    fn new(conf: Configuration) -> CloudWatch {
-        let client = CloudWatchLogsClient::new(Region::default());
+    async fn new(conf: Configuration) -> CloudWatch {
+        let region_provider = RegionProviderChain::default_provider()
+            .or_else(Region::new("us-west-2"));
+
+        let shared_config =
+            aws_config::from_env().region(region_provider).load().await;
+
+        let client = Client::new(&shared_config);
+
         let mut cw = CloudWatch {
             sequence_token: None,
             client,
             conf,
         };
-        cw.update_sequence_token();
+        cw.update_sequence_token().await;
         cw
     }
 
-    fn get_log_stream(&self) -> Option<LogStream> {
+    async fn get_log_stream(&self) -> Option<LogStream> {
         let result = self
             .client
-            .describe_log_streams(DescribeLogStreamsRequest {
-                log_group_name: self.conf.log_group_name.clone(),
-                log_stream_name_prefix: Some(self.conf.log_stream_name.clone()),
-                limit: Some(1),
-                ..Default::default()
-            })
-            .sync();
+            .describe_log_streams()
+            .log_group_name(self.conf.log_group_name.clone())
+            .log_stream_name_prefix(self.conf.log_stream_name.clone())
+            .limit(1)
+            .send()
+            .await;
         match result {
             Ok(result) => {
                 if let Some(log_streams) = result.log_streams {
@@ -57,24 +61,24 @@ impl CloudWatch {
         }
     }
 
-    fn create_log_stream(&self) {
+    async fn create_log_stream(&self) {
         if let Err(err) = self
             .client
-            .create_log_stream(CreateLogStreamRequest {
-                log_group_name: self.conf.log_group_name.clone(),
-                log_stream_name: self.conf.log_stream_name.clone(),
-            })
-            .sync()
+            .create_log_stream()
+            .log_group_name(self.conf.log_group_name.clone())
+            .log_stream_name(self.conf.log_stream_name.clone())
+            .send()
+            .await
         {
             eprintln!("failed to create log stream: {}", err);
         }
     }
 
-    fn update_sequence_token(&mut self) {
-        let mut log_stream = self.get_log_stream();
+    async fn update_sequence_token(&mut self) {
+        let mut log_stream = self.get_log_stream().await;
         if log_stream.is_none() {
-            self.create_log_stream();
-            log_stream = self.get_log_stream();
+            self.create_log_stream().await;
+            log_stream = self.get_log_stream().await;
         }
 
         if let Some(log_stream) = log_stream {
@@ -89,22 +93,23 @@ impl Uploader for CloudWatch {
     fn upload(&mut self, events: Vec<InputLogEvent>) {
         self.conf
             .debug(format!("uploading {} events", events.len()));
-        let result = self
+        let mut call = self
             .client
-            .put_log_events(PutLogEventsRequest {
-                log_events: events,
-                log_group_name: self.conf.log_group_name.clone(),
-                log_stream_name: self.conf.log_stream_name.clone(),
-                sequence_token: self.sequence_token.clone(),
-            })
-            .sync();
+            .put_log_events()
+            .log_group_name(self.conf.log_group_name.clone())
+            .log_stream_name(self.conf.log_stream_name.clone());
+        if let Some(sequence_token) = &self.sequence_token {
+            call = call.sequence_token(sequence_token);
+        }
+        call = call.set_log_events(Some(events));
+        let result = futures::executor::block_on(call.send());
         match result {
             Ok(result) => {
                 self.sequence_token = result.next_sequence_token;
             }
             Err(err) => {
                 eprintln!("send_to_cloudwatch failed: {}", err);
-                self.update_sequence_token();
+                futures::executor::block_on(self.update_sequence_token());
             }
         }
     }
@@ -116,7 +121,10 @@ impl Uploader for CloudWatch {
 /// Reference:
 /// docs.aws.amazon.com/AmazonCloudWatchLogs/latest/APIReference/API_PutLogEvents.html
 fn get_event_num_bytes(event: &InputLogEvent) -> usize {
-    event.message.len() + 26
+    match &event.message {
+        Some(m) => m.len() + 26,
+        None => 26,
+    }
 }
 
 struct UploadThreadState<U: Uploader> {
@@ -141,13 +149,12 @@ impl<U: Uploader> UploadThreadState<U> {
     }
 
     fn push(&mut self, event: InputLogEvent) {
-        self.conf
-            .debug("upload thread event received".to_string());
+        self.conf.debug("upload thread event received".to_string());
 
         // Flush if the latest event's timestamp is older than the
         // previous event
         if let Some(last_timestamp) = self.last_timestamp {
-            if event.timestamp < last_timestamp {
+            if event.timestamp < Some(last_timestamp) {
                 self.flush();
             }
         }
@@ -167,17 +174,16 @@ impl<U: Uploader> UploadThreadState<U> {
 
         // Add the event to the pending events
         if self.first_timestamp.is_none() {
-            self.first_timestamp = Some(event.timestamp);
+            self.first_timestamp = event.timestamp;
         }
-        self.last_timestamp = Some(event.timestamp);
+        self.last_timestamp = event.timestamp;
         self.num_pending_bytes += event_num_bytes;
         self.events.push(event);
     }
 
     /// Upload all pending events to CloudWatch Logs
     fn flush(&mut self) {
-        self.conf
-            .debug(format!("flush: {}", self.summary()));
+        self.conf.debug(format!("flush: {}", self.summary()));
 
         if self.events.is_empty() {
             return;
@@ -199,14 +205,17 @@ impl<U: Uploader> UploadThreadState<U> {
     }
 }
 
-pub fn upload_thread(conf: Configuration, rx: mpsc::Receiver<InputLogEvent>) {
+pub async fn upload_thread(
+    conf: Configuration,
+    mut rx: mpsc::UnboundedReceiver<InputLogEvent>,
+) {
     conf.debug("upload thread started".to_string());
-    let uploader = CloudWatch::new(conf.clone());
+    let uploader = CloudWatch::new(conf.clone()).await;
     let mut state = UploadThreadState::new(uploader, conf.clone());
     loop {
         conf.debug(format!("upload thread state: {}", state.summary()));
 
-        if let Ok(record) = rx.recv_timeout(Duration::from_secs(1)) {
+        if let Some(record) = rx.recv().await {
             state.push(record);
         }
 
@@ -221,6 +230,8 @@ pub fn upload_thread(conf: Configuration, rx: mpsc::Receiver<InputLogEvent>) {
 
 #[cfg(test)]
 mod tests {
+    use aws_types::SdkConfig;
+
     use super::*;
 
     fn create_conf() -> Configuration {
@@ -228,6 +239,9 @@ mod tests {
             log_group_name: "myGroup".to_string(),
             log_stream_name: "myStream".to_string(),
             is_debug_mode_enabled: false,
+            aws_config: SdkConfig::builder()
+                .region(Region::from_static("us-test-2"))
+                .build(),
         }
     }
 
@@ -237,9 +251,7 @@ mod tests {
 
     impl MockUploader {
         fn new() -> MockUploader {
-            MockUploader {
-                events: Vec::new(),
-            }
+            MockUploader { events: Vec::new() }
         }
     }
 
@@ -253,10 +265,12 @@ mod tests {
     fn test_manual_flush() {
         let uploader = MockUploader::new();
         let mut state = UploadThreadState::new(uploader, create_conf());
-        state.push(InputLogEvent {
-            message: "myMessage".to_string(),
-            timestamp: Utc::now().timestamp_millis(),
-        });
+        state.push(
+            InputLogEvent::builder()
+                .message("myMessage".to_string())
+                .timestamp(Utc::now().timestamp_millis())
+                .build(),
+        );
         assert_eq!(state.uploader.events.len(), 0);
         state.flush();
         assert_eq!(state.uploader.events.len(), 1);
@@ -266,16 +280,19 @@ mod tests {
     fn test_out_of_order_events() {
         let uploader = MockUploader::new();
         let mut state = UploadThreadState::new(uploader, create_conf());
-        state.push(InputLogEvent {
-            message: "myMessage1".to_string(),
-            timestamp: 2,
-        });
+        state.push(
+            InputLogEvent::builder()
+                .message("myMessage1".to_string())
+                .timestamp(2)
+                .build(),
+        );
         assert_eq!(state.uploader.events.len(), 0);
-        state.push(InputLogEvent {
-            message: "myMessage2".to_string(),
-            // This message is older than the first message
-            timestamp: 1,
-        });
+        state.push(
+            InputLogEvent::builder()
+                .message("myMessage2".to_string())
+                .timestamp(1)
+                .build(),
+        );
         assert_eq!(state.uploader.events.len(), 1);
     }
 
@@ -283,16 +300,19 @@ mod tests {
     fn test_simultaneous_events() {
         let uploader = MockUploader::new();
         let mut state = UploadThreadState::new(uploader, create_conf());
-        state.push(InputLogEvent {
-            message: "myMessage1".to_string(),
-            timestamp: 1,
-        });
+        state.push(
+            InputLogEvent::builder()
+                .message("myMessage1".to_string())
+                .timestamp(1)
+                .build(),
+        );
         assert_eq!(state.uploader.events.len(), 0);
-        state.push(InputLogEvent {
-            message: "myMessage2".to_string(),
-            // This message has the same timestamp as the previous message
-            timestamp: 1,
-        });
+        state.push(
+            InputLogEvent::builder()
+                .message("myMessage2".to_string())
+                .timestamp(1)
+                .build(),
+        );
         assert_eq!(state.uploader.events.len(), 0);
     }
 }

@@ -1,17 +1,20 @@
 [package]
 name = "journald-to-cloudwatch"
-version = "1.2.0"
-authors = ["Nicholas Bishop <nicholasbishop@gmail.com>"]
-edition = "2018"
+version = "2.0.0"
+authors = ["Nicholas Bishop <nicholasbishop@gmail.com>", "Chris Rose <offby1@offby1.net>"]
+edition = "2021"
 description = "Service that copies logs from journald to AWS CloudWatch Logs."
 license = "Apache-2.0"
 readme = "README.md"
-repository = "https://github.com/nicholasbishop/journald-to-cloudwatch"
+repository = "https://github.com/offbyone/journald-to-cloudwatch"
 
 [dependencies]
 chrono = "^0.4"
-reqwest = "^0.9"
-rusoto_core = "^0.47"
-rusoto_ec2 = "^0.47"
-rusoto_logs = "^0.47"
-systemd = "^0.4"
+reqwest = "^0.11"
+systemd = "^0.10"
+aws-types = "0.10.1"
+aws-config = "0.10.1"
+aws-sdk-ec2 = "0.10.1"
+aws-sdk-cloudwatchlogs = "0.10.1"
+tokio = { version = "1.17.0", features = ["full"] }
+futures = "^0.3"

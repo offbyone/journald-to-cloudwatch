@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 try:
-    import toml
+    import tomli
 except ModuleNotFoundError:
     print('missing toml package; try "pip3 install --user toml"')
     sys.exit(1)
@@ -21,8 +21,8 @@ def run_cmd(*cmd):
 
 def read_version():
     path = os.path.join(REPO_DIR, "Cargo.toml")
-    with open(path) as rfile:
-        cargo = toml.load(rfile)
+    with open(path, mode="rb") as rfile:
+        cargo = tomli.load(rfile)
         return cargo["package"]["version"]
 
 
@@ -36,9 +36,10 @@ def main():
         output_dir, "journald-to-cloudwatch-{}.tar.gz".format(version)
     )
 
-    run_cmd("sudo", "docker", "build", "-t", image_name, "-f", dockerfile, ".")
     run_cmd(
-        "sudo",
+        "docker", "buildx", "build", "--load", "-t", image_name, "-f", dockerfile, "."
+    )
+    run_cmd(
         "docker",
         "run",
         "-e",
@@ -53,7 +54,7 @@ def main():
         "{}:/host:z".format(output_dir),
         image_name,
     )
-    run_cmd("sudo", "chown", "{}:{}".format(os.getuid(), os.getgid()), exe_path)
+    run_cmd("chown", "{}:{}".format(os.getuid(), os.getgid()), exe_path)
     if os.path.exists(tar_path):
         os.remove(tar_path)
     run_cmd(
