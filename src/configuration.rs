@@ -21,7 +21,7 @@ impl Configuration {
         let aws_config =
             aws_config::from_env().region(region_provider).load().await;
 
-        let log_stream_name = get_log_stream_name(aws_config.clone()).await;
+        let log_stream_name = get_log_stream_name().await;
         Configuration {
             log_group_name: var("LOG_GROUP_NAME")
                 .unwrap_or("journald-to-cloudwatch".to_string()),
@@ -42,19 +42,12 @@ impl Configuration {
     }
 }
 
-async fn get_log_stream_name(sdk_config: SdkConfig) -> String {
+async fn get_log_stream_name() -> String {
     match ec2::get_instance_id().await {
-        Ok(id) => match ec2::get_instance_name(sdk_config, id).await {
-            Ok(name) => {
-                return name;
-            }
-            Err(err) => {
-                println!("get_instance_name failed: {:?}", err);
-            }
-        },
+        Ok(id) => id,
         Err(err) => {
             println!("get_instance_id failed: {}", err);
+            "not-ec2".to_string()
         }
     }
-    "unknown".to_string()
 }
