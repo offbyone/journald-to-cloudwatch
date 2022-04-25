@@ -1,0 +1,15 @@
+FROM ubuntu:focal
+
+# Fix timezone issue
+ENV TZ=Europe/London
+RUN ln -snf /usr/share/zoneinfo/$TZ /etc/localtime && echo $TZ > /etc/timezone
+
+RUN apt update
+RUN apt-get install -y build-essential libssl1.1 libssl-dev pkg-config libsystemd-dev curl rsync
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+
+WORKDIR /build
+COPY tools/ ./tools/
+
+ENTRYPOINT ["tools/in_container_run.sh"]
