@@ -1,4 +1,5 @@
 use crate::configuration::Configuration;
+use async_trait::async_trait;
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_cloudwatchlogs::model::{InputLogEvent, LogStream};
 use aws_sdk_cloudwatchlogs::{Client, Region};
@@ -6,8 +7,9 @@ use chrono::Utc;
 
 use tokio::sync::mpsc;
 
+#[async_trait]
 trait Uploader {
-    fn upload(&mut self, events: Vec<InputLogEvent>);
+    async fn upload(&mut self, events: Vec<InputLogEvent>);
 }
 
 struct CloudWatch {
@@ -89,10 +91,11 @@ impl CloudWatch {
     }
 }
 
+#[async_trait]
 impl Uploader for CloudWatch {
-    fn upload(&mut self, events: Vec<InputLogEvent>) {
+    async fn upload(&mut self, events: Vec<InputLogEvent>) {
         self.conf
-            .debug(format!("uploading {} events", events.len()));
+            .debug(format!("--F> uploading {} events", events.len()));
         let mut call = self
             .client
             .put_log_events()
@@ -102,14 +105,14 @@ impl Uploader for CloudWatch {
             call = call.sequence_token(sequence_token);
         }
         call = call.set_log_events(Some(events));
-        let result = futures::executor::block_on(call.send());
+        let result = call.send().await;
         match result {
             Ok(result) => {
                 self.sequence_token = result.next_sequence_token;
             }
             Err(err) => {
-                eprintln!("send_to_cloudwatch failed: {}", err);
-                futures::executor::block_on(self.update_sequence_token());
+                eprintln!("--F> send_to_cloudwatch failed: {}", err);
+                self.update_sequence_token().await
             }
         }
     }
@@ -148,14 +151,12 @@ impl<U: Uploader> UploadThreadState<U> {
         }
     }
 
-    fn push(&mut self, event: InputLogEvent) {
-        self.conf.debug("upload thread event received".to_string());
-
+    async fn push(&mut self, event: InputLogEvent) {
         // Flush if the latest event's timestamp is older than the
         // previous event
         if let Some(last_timestamp) = self.last_timestamp {
             if event.timestamp < Some(last_timestamp) {
-                self.flush();
+                self.flush().await;
             }
         }
 
@@ -163,13 +164,17 @@ impl<U: Uploader> UploadThreadState<U> {
         let max_bytes = 1048576;
         let event_num_bytes = get_event_num_bytes(&event);
         if self.num_pending_bytes + event_num_bytes > max_bytes {
-            self.flush();
+            self.flush().await;
         }
 
         // Flush if the maximum number of events has been reached
-        let max_events = 10000;
+        let max_events = if self.conf.is_debug_mode_enabled {
+            1
+        } else {
+            100
+        };
         if self.events.len() + 1 >= max_events {
-            self.flush();
+            self.flush().await;
         }
 
         // Add the event to the pending events
@@ -182,7 +187,7 @@ impl<U: Uploader> UploadThreadState<U> {
     }
 
     /// Upload all pending events to CloudWatch Logs
-    fn flush(&mut self) {
+    async fn flush(&mut self) {
         self.conf.debug(format!("flush: {}", self.summary()));
 
         if self.events.is_empty() {
@@ -191,7 +196,7 @@ impl<U: Uploader> UploadThreadState<U> {
 
         let mut events = Vec::new();
         std::mem::swap(&mut events, &mut self.events);
-        self.uploader.upload(events);
+        self.uploader.upload(events).await;
         self.first_timestamp = None;
         self.last_timestamp = None;
         self.num_pending_bytes = 0;
@@ -207,23 +212,23 @@ impl<U: Uploader> UploadThreadState<U> {
 
 pub async fn upload_thread(
     conf: Configuration,
-    mut rx: mpsc::UnboundedReceiver<InputLogEvent>,
+    mut rx: mpsc::Receiver<InputLogEvent>,
 ) {
     conf.debug("upload thread started".to_string());
     let uploader = CloudWatch::new(conf.clone()).await;
     let mut state = UploadThreadState::new(uploader, conf.clone());
-    loop {
-        conf.debug(format!("upload thread state: {}", state.summary()));
+    while let Some(record) = rx.recv().await {
+        state.push(record).await;
+    }
+    conf.debug(
+        "The receiver has been dropped and the event queue is drained"
+            .to_string(),
+    );
 
-        if let Some(record) = rx.recv().await {
-            state.push(record);
-        }
-
-        // If we have "old" records, flush now
-        if let Some(first_timestamp) = state.first_timestamp {
-            if Utc::now().timestamp_millis() - first_timestamp > 1000 {
-                state.flush();
-            }
+    // If we have "old" records, flush now
+    if let Some(first_timestamp) = state.first_timestamp {
+        if Utc::now().timestamp_millis() - first_timestamp > 1000 {
+            state.flush().await;
         }
     }
 }
@@ -255,14 +260,15 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Uploader for MockUploader {
-        fn upload(&mut self, mut events: Vec<InputLogEvent>) {
+        async fn upload(&mut self, mut events: Vec<InputLogEvent>) {
             self.events.append(&mut events);
         }
     }
 
     #[test]
-    fn test_manual_flush() {
+    async fn test_manual_flush() {
         let uploader = MockUploader::new();
         let mut state = UploadThreadState::new(uploader, create_conf());
         state.push(
@@ -272,7 +278,7 @@ mod tests {
                 .build(),
         );
         assert_eq!(state.uploader.events.len(), 0);
-        state.flush();
+        state.flush().await;
         assert_eq!(state.uploader.events.len(), 1);
     }
 
