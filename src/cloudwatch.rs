@@ -4,11 +4,16 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_cloudwatchlogs::model::{InputLogEvent, LogStream};
 use aws_sdk_cloudwatchlogs::{Client, Region};
 use chrono::Utc;
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 
 #[async_trait]
 trait Uploader {
+    fn group_events(
+        &self,
+        events: Vec<InputLogEvent>,
+    ) -> Vec<Vec<InputLogEvent>>;
     async fn upload(&mut self, events: Vec<InputLogEvent>);
 }
 
@@ -91,28 +96,82 @@ impl CloudWatch {
     }
 }
 
+fn do_group_events(events: Vec<InputLogEvent>) -> Vec<Vec<InputLogEvent>> {
+    // Group events by 16 hour windows (cloudwatch requires events be in 24 groups)
+
+    // Why in this form? Because it's a bit easier to understand that it's a time.
+    let sixteen =
+        i64::try_from(Duration::from_secs(57600).as_millis()).unwrap();
+
+    let mut groups: Vec<Vec<InputLogEvent>> = Vec::new();
+    // First, we order the events by their timestamps
+    let mut sorted = events.to_vec();
+    sorted.sort_by(|a, b| a.timestamp.cmp(&b.timestamp));
+    for event in sorted.into_iter() {
+        if let None = groups.last() {
+            let mut new_group = Vec::new();
+            new_group.push(event);
+            groups.push(new_group);
+            continue;
+        }
+
+        // check to see if the last group is the one we want
+        let mut existing_group = groups.pop().unwrap();
+        let first = existing_group.first().unwrap();
+        let too_new = match event.timestamp {
+            Some(ts) => match first.timestamp {
+                Some(fts) => ts - sixteen > fts,
+                None => true,
+            },
+            None => true,
+        };
+
+        if too_new {
+            // too new; make a new group
+            // but first, put the old one back
+            groups.push(existing_group);
+            let mut new_group = Vec::new();
+            new_group.push(event);
+            groups.push(new_group);
+        } else {
+            existing_group.push(event);
+            groups.push(existing_group);
+        }
+    }
+    groups
+}
+
 #[async_trait]
 impl Uploader for CloudWatch {
+    fn group_events(
+        &self,
+        events: Vec<InputLogEvent>,
+    ) -> Vec<Vec<InputLogEvent>> {
+        do_group_events(events)
+    }
+
     async fn upload(&mut self, events: Vec<InputLogEvent>) {
         self.conf
             .debug(format!("--F> uploading {} events", events.len()));
-        let mut call = self
-            .client
-            .put_log_events()
-            .log_group_name(self.conf.log_group_name.clone())
-            .log_stream_name(self.conf.log_stream_name.clone());
-        if let Some(sequence_token) = &self.sequence_token {
-            call = call.sequence_token(sequence_token);
-        }
-        call = call.set_log_events(Some(events));
-        let result = call.send().await;
-        match result {
-            Ok(result) => {
-                self.sequence_token = result.next_sequence_token;
+        for group in self.group_events(events).iter() {
+            let mut call = self
+                .client
+                .put_log_events()
+                .log_group_name(self.conf.log_group_name.clone())
+                .log_stream_name(self.conf.log_stream_name.clone());
+            if let Some(sequence_token) = &self.sequence_token {
+                call = call.sequence_token(sequence_token);
             }
-            Err(err) => {
-                eprintln!("--F> send_to_cloudwatch failed: {}", err);
-                self.update_sequence_token().await
+            call = call.set_log_events(Some(group.to_vec()));
+            let result = call.send().await;
+            match result {
+                Ok(result) => {
+                    self.sequence_token = result.next_sequence_token;
+                }
+                Err(err) => {
+                    eprintln!("--F> send_to_cloudwatch failed: {}", err);
+                    self.update_sequence_token().await
+                }
             }
         }
     }
@@ -262,63 +321,137 @@ mod tests {
 
     #[async_trait]
     impl Uploader for MockUploader {
+        fn group_events(
+            &self,
+            events: Vec<InputLogEvent>,
+        ) -> Vec<Vec<InputLogEvent>> {
+            super::do_group_events(events)
+        }
         async fn upload(&mut self, mut events: Vec<InputLogEvent>) {
             self.events.append(&mut events);
         }
     }
 
-    #[test]
+    #[tokio::test]
     async fn test_manual_flush() {
         let uploader = MockUploader::new();
         let mut state = UploadThreadState::new(uploader, create_conf());
-        state.push(
-            InputLogEvent::builder()
-                .message("myMessage".to_string())
-                .timestamp(Utc::now().timestamp_millis())
-                .build(),
-        );
+        state
+            .push(
+                InputLogEvent::builder()
+                    .message("myMessage".to_string())
+                    .timestamp(Utc::now().timestamp_millis())
+                    .build(),
+            )
+            .await;
         assert_eq!(state.uploader.events.len(), 0);
         state.flush().await;
         assert_eq!(state.uploader.events.len(), 1);
     }
 
-    #[test]
-    fn test_out_of_order_events() {
+    #[tokio::test]
+    async fn test_out_of_order_events() {
         let uploader = MockUploader::new();
         let mut state = UploadThreadState::new(uploader, create_conf());
-        state.push(
-            InputLogEvent::builder()
-                .message("myMessage1".to_string())
-                .timestamp(2)
-                .build(),
-        );
+        state
+            .push(
+                InputLogEvent::builder()
+                    .message("myMessage1".to_string())
+                    .timestamp(2)
+                    .build(),
+            )
+            .await;
         assert_eq!(state.uploader.events.len(), 0);
-        state.push(
-            InputLogEvent::builder()
-                .message("myMessage2".to_string())
-                .timestamp(1)
-                .build(),
-        );
+        state
+            .push(
+                InputLogEvent::builder()
+                    .message("myMessage2".to_string())
+                    .timestamp(1)
+                    .build(),
+            )
+            .await;
         assert_eq!(state.uploader.events.len(), 1);
     }
 
-    #[test]
-    fn test_simultaneous_events() {
+    #[tokio::test]
+    async fn test_simultaneous_events() {
         let uploader = MockUploader::new();
         let mut state = UploadThreadState::new(uploader, create_conf());
-        state.push(
+        state
+            .push(
+                InputLogEvent::builder()
+                    .message("myMessage1".to_string())
+                    .timestamp(1)
+                    .build(),
+            )
+            .await;
+        assert_eq!(state.uploader.events.len(), 0);
+        state
+            .push(
+                InputLogEvent::builder()
+                    .message("myMessage2".to_string())
+                    .timestamp(1)
+                    .build(),
+            )
+            .await;
+        assert_eq!(state.uploader.events.len(), 0);
+    }
+
+    #[test]
+    fn test_events_more_than_24h_apart() {
+        let uploader = MockUploader::new();
+        let sooner = Utc::now().timestamp_millis()
+            - i64::try_from(Duration::from_secs(86400 * 2).as_millis())
+                .unwrap();
+        let later = Utc::now().timestamp_millis();
+        let mut events = Vec::with_capacity(3);
+        events.push(
             InputLogEvent::builder()
-                .message("myMessage1".to_string())
-                .timestamp(1)
+                .message("ev1".to_string())
+                .timestamp(sooner)
                 .build(),
         );
-        assert_eq!(state.uploader.events.len(), 0);
-        state.push(
+        events.push(
             InputLogEvent::builder()
-                .message("myMessage2".to_string())
-                .timestamp(1)
+                .message("ev2".to_string())
+                .timestamp(sooner + 42)
                 .build(),
         );
-        assert_eq!(state.uploader.events.len(), 0);
+        events.push(
+            InputLogEvent::builder()
+                .message("ev3".to_string())
+                .timestamp(later)
+                .build(),
+        );
+        assert_eq!(uploader.group_events(events).len(), 2);
+    }
+
+    #[test]
+    fn test_events_separated_by_17_apart() {
+        let uploader = MockUploader::new();
+        let interval =
+            i64::try_from(Duration::from_secs(17 * 60 * 60).as_millis())
+                .unwrap();
+        let mut events = Vec::with_capacity(3);
+        let now = Utc::now().timestamp_millis();
+        events.push(
+            InputLogEvent::builder()
+                .message("ev1".to_string())
+                .timestamp(now - (2 * interval))
+                .build(),
+        );
+        events.push(
+            InputLogEvent::builder()
+                .message("ev2".to_string())
+                .timestamp(now - interval)
+                .build(),
+        );
+        events.push(
+            InputLogEvent::builder()
+                .message("ev3".to_string())
+                .timestamp(now)
+                .build(),
+        );
+        assert_eq!(uploader.group_events(events).len(), 3);
     }
 }
